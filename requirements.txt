@@ -11,6 +11,6 @@ faiss-cpu
 pypdf
 sentence-transformers
 torch
-duckduckgo-search
+ddgs
 python-dotenv
 requests
