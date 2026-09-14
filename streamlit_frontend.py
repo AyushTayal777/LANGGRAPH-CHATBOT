@@ -2,6 +2,7 @@ import uuid
 
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 
 from langgraph_backend import (
     chatbot,
@@ -12,6 +13,7 @@ from langgraph_backend import (
 
 
 # =========================== Utilities ===========================
+
 def generate_thread_id():
     return uuid.uuid4()
 
@@ -21,6 +23,7 @@ def reset_chat():
     st.session_state["thread_id"] = thread_id
     add_thread(thread_id)
     st.session_state["message_history"] = []
+    st.session_state["pending_interrupt"] = None
 
 
 def add_thread(thread_id):
@@ -29,11 +32,22 @@ def add_thread(thread_id):
 
 
 def load_conversation(thread_id):
-    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
+    state = chatbot.get_state(
+        config={"configurable": {"thread_id": thread_id}}
+    )
     return state.values.get("messages", [])
 
 
+def get_config(thread_key):
+    return {
+        "configurable": {"thread_id": thread_key},
+        "metadata": {"thread_id": thread_key},
+        "run_name": "chat_turn",
+    }
+
+
 # ======================= Session Initialization ===================
+
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
 
@@ -46,127 +60,459 @@ if "chat_threads" not in st.session_state:
 if "ingested_docs" not in st.session_state:
     st.session_state["ingested_docs"] = {}
 
+if "pending_interrupt" not in st.session_state:
+    st.session_state["pending_interrupt"] = None
+
 add_thread(st.session_state["thread_id"])
 
 thread_key = str(st.session_state["thread_id"])
-thread_docs = st.session_state["ingested_docs"].setdefault(thread_key, {})
+
+thread_docs = st.session_state["ingested_docs"].setdefault(
+    thread_key, {}
+)
+
 threads = st.session_state["chat_threads"][::-1]
+
 selected_thread = None
 
-# ============================ Sidebar ============================
-st.sidebar.title("LangGraph PDF Chatbot")
-st.sidebar.markdown(f"**Thread ID:** `{thread_key}`")
 
-if st.sidebar.button("New Chat", use_container_width=True):
+# ============================ Sidebar ============================
+
+st.sidebar.title("LangGraph PDF Chatbot")
+
+st.sidebar.markdown(
+    f"**Thread ID:** `{thread_key}`"
+)
+
+
+if st.sidebar.button(
+    "New Chat",
+    use_container_width=True
+):
     reset_chat()
     st.rerun()
 
+
 if thread_docs:
     latest_doc = list(thread_docs.values())[-1]
+
     st.sidebar.success(
         f"Using `{latest_doc.get('filename')}` "
-        f"({latest_doc.get('chunks')} chunks from {latest_doc.get('documents')} pages)"
+        f"({latest_doc.get('chunks')} chunks "
+        f"from {latest_doc.get('documents')} pages)"
     )
 else:
     st.sidebar.info("No PDF indexed yet.")
 
-uploaded_pdf = st.sidebar.file_uploader("Upload a PDF for this chat", type=["pdf"])
+
+uploaded_pdf = st.sidebar.file_uploader(
+    "Upload a PDF for this chat",
+    type=["pdf"]
+)
+
+
 if uploaded_pdf:
+
     if uploaded_pdf.name in thread_docs:
-        st.sidebar.info(f"`{uploaded_pdf.name}` already processed for this chat.")
+
+        st.sidebar.info(
+            f"`{uploaded_pdf.name}` already processed for this chat."
+        )
+
     else:
-        with st.sidebar.status("Indexing PDF…", expanded=True) as status_box:
+
+        with st.sidebar.status(
+            "Indexing PDF…",
+            expanded=True
+        ) as status_box:
+
             summary = ingest_pdf(
                 uploaded_pdf.getvalue(),
                 thread_id=thread_key,
                 filename=uploaded_pdf.name,
             )
+
             thread_docs[uploaded_pdf.name] = summary
-            status_box.update(label="✅ PDF indexed", state="complete", expanded=False)
+
+            status_box.update(
+                label="✅ PDF indexed",
+                state="complete",
+                expanded=False
+            )
+
 
 st.sidebar.subheader("Past conversations")
+
+
 if not threads:
+
     st.sidebar.write("No past conversations yet.")
+
 else:
+
     for thread_id in threads:
-        if st.sidebar.button(str(thread_id), key=f"side-thread-{thread_id}"):
+
+        if st.sidebar.button(
+            str(thread_id),
+            key=f"side-thread-{thread_id}"
+        ):
+
             selected_thread = thread_id
 
+
 # ============================ Main Layout ========================
+
 st.title("Multi Utility Chatbot")
 
-# Chat area
+
+# ============================ Chat History ========================
+
 for message in st.session_state["message_history"]:
+
     with st.chat_message(message["role"]):
         st.text(message["content"])
 
-user_input = st.chat_input("Ask about your document or use tools")
 
-if user_input:
-    st.session_state["message_history"].append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.text(user_input)
+# ============================ HITL Resume =========================
+#
+# IMPORTANT:
+# This is OUTSIDE `if user_input`.
+# Therefore the buttons survive Streamlit reruns.
 
-    CONFIG = {
-        "configurable": {"thread_id": thread_key},
-        "metadata": {"thread_id": thread_key},
-        "run_name": "chat_turn",
-    }
+if st.session_state["pending_interrupt"]:
 
-    with st.chat_message("assistant"):
-        status_holder = {"box": None}
+    pending = st.session_state["pending_interrupt"]
 
-        def ai_only_stream():
+    st.warning(
+        f"⚠️ {pending['message']}"
+    )
+
+    col1, col2 = st.columns(2)
+
+
+    with col1:
+
+        approve = st.button(
+            "✅ Approve",
+            key=f"approve-{thread_key}",
+            use_container_width=True,
+        )
+
+
+    with col2:
+
+        reject = st.button(
+            "❌ Reject",
+            key=f"reject-{thread_key}",
+            use_container_width=True,
+        )
+
+
+    if approve or reject:
+
+        decision = "yes" if approve else "no"
+
+        CONFIG = get_config(thread_key)
+
+        with st.chat_message("assistant"):
+
+            status_holder = {"box": None}
+
+            resumed_chunks = []
+
+
             for message_chunk, _ in chatbot.stream(
-                {"messages": [HumanMessage(content=user_input)],
-                "thread_id": thread_key,},
+                Command(resume=decision),
                 config=CONFIG,
                 stream_mode="messages",
             ):
-                if isinstance(message_chunk, ToolMessage):
-                    tool_name = getattr(message_chunk, "name", "tool")
+
+                if isinstance(
+                    message_chunk,
+                    ToolMessage
+                ):
+
+                    tool_name = getattr(
+                        message_chunk,
+                        "name",
+                        "tool"
+                    )
+
                     if status_holder["box"] is None:
+
                         status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}` …", expanded=True
-                        )
-                    else:
-                        status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` …",
-                            state="running",
+                            f"🔧 Using `{tool_name}` …",
                             expanded=True,
                         )
 
-                if isinstance(message_chunk, AIMessage):
-                    yield message_chunk.content
 
-        ai_message = st.write_stream(ai_only_stream())
+                if isinstance(
+                    message_chunk,
+                    AIMessage
+                ):
 
-        if status_holder["box"] is not None:
-            status_holder["box"].update(
-                label="✅ Tool finished", state="complete", expanded=False
+                    if message_chunk.content:
+
+                        resumed_chunks.append(
+                            message_chunk.content
+                        )
+
+
+            resumed_message = "".join(
+                resumed_chunks
             )
 
+
+            if status_holder["box"] is not None:
+
+                status_holder["box"].update(
+                    label="✅ Tool finished",
+                    state="complete",
+                    expanded=False
+                )
+
+
+            if resumed_message:
+
+                st.write(resumed_message)
+
+
+        if resumed_message:
+
+            st.session_state[
+                "message_history"
+            ].append(
+                {
+                    "role": "assistant",
+                    "content": resumed_message,
+                }
+            )
+
+
+        # Clear the interrupt AFTER successful resume
+        st.session_state[
+            "pending_interrupt"
+        ] = None
+
+
+        st.rerun()
+
+
+# ============================ User Input ==========================
+
+user_input = st.chat_input(
+    "Ask about your document or use tools"
+)
+
+
+if user_input:
+
     st.session_state["message_history"].append(
-        {"role": "assistant", "content": ai_message}
+        {
+            "role": "user",
+            "content": user_input
+        }
     )
 
-    doc_meta = thread_document_metadata(thread_key)
-    if doc_meta:
-        st.caption(
-            f"Document indexed: {doc_meta.get('filename')} "
-            f"(chunks: {doc_meta.get('chunks')}, pages: {doc_meta.get('documents')})"
+
+    with st.chat_message("user"):
+        st.text(user_input)
+
+
+    CONFIG = get_config(thread_key)
+
+
+    with st.chat_message("assistant"):
+
+        status_holder = {"box": None}
+
+        response_chunks = []
+
+
+        for message_chunk, _ in chatbot.stream(
+            {
+                "messages": [
+                    HumanMessage(
+                        content=user_input
+                    )
+                ],
+                "thread_id": thread_key,
+            },
+            config=CONFIG,
+            stream_mode="messages",
+        ):
+
+            if isinstance(
+                message_chunk,
+                ToolMessage
+            ):
+
+                tool_name = getattr(
+                    message_chunk,
+                    "name",
+                    "tool"
+                )
+
+
+                if status_holder["box"] is None:
+
+                    status_holder["box"] = st.status(
+                        f"🔧 Using `{tool_name}` …",
+                        expanded=True,
+                    )
+
+
+                else:
+
+                    status_holder["box"].update(
+                        label=f"🔧 Using `{tool_name}` …",
+                        state="running",
+                        expanded=True,
+                    )
+
+
+            if isinstance(
+                message_chunk,
+                AIMessage
+            ):
+
+                if message_chunk.content:
+
+                    response_chunks.append(
+                        message_chunk.content
+                    )
+
+
+        ai_message = "".join(
+            response_chunks
         )
+
+
+        if status_holder["box"] is not None:
+
+            status_holder["box"].update(
+                label="✅ Tool finished",
+                state="complete",
+                expanded=False
+            )
+
+
+        if ai_message:
+
+            st.write(ai_message)
+
+
+    # ==============================================================
+    # Check if LangGraph paused at an interrupt
+    # ==============================================================
+
+    graph_state = chatbot.get_state(CONFIG)
+
+
+    if graph_state.tasks:
+
+        interrupts = (
+            graph_state.tasks[0].interrupts
+        )
+
+
+        if interrupts:
+
+            interrupt_value = interrupts[0].value
+
+
+            # Store interrupt in Streamlit session
+            st.session_state[
+                "pending_interrupt"
+            ] = {
+                "message": str(interrupt_value)
+            }
+
+
+            # Rerun so the approval UI is rendered
+            st.rerun()
+
+
+    # Only add normal AI response if there wasn't an interrupt
+    if ai_message:
+
+        st.session_state[
+            "message_history"
+        ].append(
+            {
+                "role": "assistant",
+                "content": ai_message,
+            }
+        )
+
+
+    doc_meta = thread_document_metadata(
+        thread_key
+    )
+
+
+    if doc_meta:
+
+        st.caption(
+            f"Document indexed: "
+            f"{doc_meta.get('filename')} "
+            f"(chunks: {doc_meta.get('chunks')}, "
+            f"pages: {doc_meta.get('documents')})"
+        )
+
+
+# ============================ Divider =============================
 
 st.divider()
 
+
+# ============================ Past Thread =========================
+
 if selected_thread:
+
     st.session_state["thread_id"] = selected_thread
-    messages = load_conversation(selected_thread)
+
+    messages = load_conversation(
+        selected_thread
+    )
+
 
     temp_messages = []
+
+
     for msg in messages:
-        role = "user" if isinstance(msg, HumanMessage) else "assistant"
-        temp_messages.append({"role": role, "content": msg.content})
-    st.session_state["message_history"] = temp_messages
-    st.session_state["ingested_docs"].setdefault(str(selected_thread), {})
+
+        role = (
+            "user"
+            if isinstance(msg, HumanMessage)
+            else "assistant"
+        )
+
+
+        temp_messages.append(
+            {
+                "role": role,
+                "content": msg.content
+            }
+        )
+
+
+    st.session_state[
+        "message_history"
+    ] = temp_messages
+
+
+    st.session_state[
+        "ingested_docs"
+    ].setdefault(
+        str(selected_thread),
+        {}
+    )
+
+
+    st.session_state[
+        "pending_interrupt"
+    ] = None
+
+
     st.rerun()

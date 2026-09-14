@@ -15,6 +15,7 @@ from langgraph.graph.message import add_messages
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.messages import SystemMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.types import interrupt, Command
 
 from dotenv import load_dotenv
 import sqlite3
@@ -157,9 +158,37 @@ def get_stock_price(symbol: str) -> dict:
     r = requests.get(url)
     return r.json()
 
+@tool
+def purchase_stock(symbol: str, quantity: int) -> dict:
+    """
+    Simulate purchasing a given quantity of a stock symbol.
+
+    HUMAN-IN-THE-LOOP:
+    Before confirming the purchase, this tool will interrupt
+    and wait for a human decision ("yes" / anything else).
+    """
+    # This pauses the graph and returns control to the caller
+    decision = interrupt(f"Approve buying {quantity} shares of {symbol}? (yes/no)")
+
+    if isinstance(decision, str) and decision.lower() == "yes":
+        return {
+            "status": "success",
+            "message": f"Purchase order placed for {quantity} shares of {symbol}.",
+            "symbol": symbol,
+            "quantity": quantity,
+        }
+    
+    else:
+        return {
+            "status": "cancelled",
+            "message": f"Purchase of {quantity} shares of {symbol} was declined by human.",
+            "symbol": symbol,
+            "quantity": quantity,
+        }
 
 
-tools = [search_tool, get_stock_price, calculator,rag_tool]
+
+tools = [search_tool, get_stock_price, calculator,rag_tool,purchase_stock]
 llm_with_tools = llm.bind_tools(tools)
 
 class ChatState(TypedDict):
