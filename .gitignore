@@ -1,0 +1,18 @@
+# Environment
+.env
+
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# SQLite database
+chatbot.db
+chatbot.db-shm
+chatbot.db-wal
+
+# VS Code
+.vscode/

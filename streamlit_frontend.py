@@ -118,7 +118,8 @@ if user_input:
 
         def ai_only_stream():
             for message_chunk, _ in chatbot.stream(
-                {"messages": [HumanMessage(content=user_input)]},
+                {"messages": [HumanMessage(content=user_input)],
+                "thread_id": thread_key,},
                 config=CONFIG,
                 stream_mode="messages",
             ):

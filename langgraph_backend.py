@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, START, END
 from typing import Annotated, Any, Dict, Optional, TypedDict
 from langchain_core.messages import BaseMessage
 from langchain_groq import ChatGroq
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode, tools_condition, InjectedState
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
 from langchain_community.vectorstores import FAISS
@@ -13,13 +13,14 @@ from langchain_community.document_loaders import PyPDFLoader
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages import SystemMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langgraph.prebuilt import ToolNode, tools_condition
+
 from dotenv import load_dotenv
 import sqlite3
 
 load_dotenv()
-
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 llm=ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0.3
@@ -115,12 +116,16 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 
 
 @tool
-def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
+def rag_tool(
+    query: str,
+    thread_id: Annotated[str, InjectedState("thread_id")]
+) -> dict:
     """
     Retrieve relevant information from the uploaded PDF for this chat thread.
-    Always include the thread_id when calling this tool.
     """
+
     retriever = _get_retriever(thread_id)
+
     if retriever is None:
         return {
             "error": "No document indexed for this chat. Upload a PDF first.",
@@ -128,6 +133,7 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
         }
 
     result = retriever.invoke(query)
+
     context = [doc.page_content for doc in result]
     metadata = [doc.metadata for doc in result]
 
@@ -135,7 +141,9 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
         "query": query,
         "context": context,
         "metadata": metadata,
-        "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
+        "source_file": _THREAD_METADATA.get(
+            str(thread_id), {}
+        ).get("filename"),
     }
 
 
@@ -145,7 +153,7 @@ def get_stock_price(symbol: str) -> dict:
     Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
     using Alpha Vantage with API key in the URL.
     """
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=C9PE94QUEW9VWGFM"
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHAVANTAGE_API_KEY}"
     r = requests.get(url)
     return r.json()
 
@@ -156,11 +164,53 @@ llm_with_tools = llm.bind_tools(tools)
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    thread_id: str
 
 def chat_node(state: ChatState):
-    """LLM node that may answer or request a tool call."""
     messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
+    thread_id = state["thread_id"]
+
+    document_info = _THREAD_METADATA.get(str(thread_id))
+
+    if document_info:
+        document_status = f"""
+A PDF is currently uploaded for this chat.
+
+Filename: {document_info.get("filename")}
+Pages: {document_info.get("documents")}
+Chunks: {document_info.get("chunks")}
+
+If the user asks about this PDF, you MUST call rag_tool.
+"""
+    else:
+        document_status = """
+No PDF is currently uploaded for this chat.
+"""
+
+    system_message = SystemMessage(
+        content=f"""
+You are a helpful multi-utility assistant.
+
+{document_status}
+
+Available tools:
+
+- rag_tool: Use this for ANY question about the uploaded PDF.
+- calculator: Use this for arithmetic calculations.
+- get_stock_price: Use this for stock prices.
+- duckduckgo search: Use this for current information or web research.
+
+IMPORTANT:
+- If a PDF is uploaded and the user asks about it, ALWAYS call rag_tool first.
+- Do not say that you cannot access the document without trying rag_tool.
+- If the user asks whether a document is available, you may answer based on the PDF status above.
+"""
+    )
+
+    response = llm_with_tools.invoke(
+        [system_message] + messages
+    )
+
     return {"messages": [response]}
 
 tool_node = ToolNode(tools)
